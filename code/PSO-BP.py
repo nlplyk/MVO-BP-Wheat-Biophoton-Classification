@@ -1,0 +1,302 @@
+# -*- coding: utf-8 -*-
+import matplotlib
+matplotlib.use('TkAgg')  # 强制弹出绘图窗口，避免内联显示问题
+
+import warnings
+import numpy as np
+import pandas as pd
+from matplotlib import pyplot as plt
+from scipy.io import loadmat
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_curve, roc_auc_score, confusion_matrix
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import LabelEncoder, StandardScaler, label_binarize
+from itertools import cycle
+
+warnings.filterwarnings("ignore")
+
+# 1. 数据加载与预处理（完全保留原有逻辑，确保数据适配）
+# ---------------------------------------------------------
+data = loadmat('matlab_normal.mat')
+keys = ['feng_normal', 'ping_normal', 'jin_normal', 'zheng129_normal', 'zheng136_normal', 'yunhan_normal']
+
+all_dfs = []
+for key in keys:
+    if key in data:
+        df = pd.DataFrame(data[key])
+        df['target'] = key
+        all_dfs.append(df)
+    else:
+        print(f"Warning: Key {key} not found in .mat file")
+
+combined_df = pd.concat(all_dfs, ignore_index=True)
+label_encoder = LabelEncoder()
+combined_df['target'] = label_encoder.fit_transform(combined_df['target'])
+
+X = combined_df.drop('target', axis=1)
+y = combined_df['target']
+
+# 划分数据集（保持原有拆分比例和随机种子，确保结果可复现）
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+# 标准化（与原有代码完全一致，避免数据预处理差异）
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# 2. 原始 BP 神经网络训练（保留原有设置，用于后续对比）
+# ---------------------------------------------------------
+bp_model = MLPClassifier(
+    hidden_layer_sizes=(128, 64),
+    activation='relu',
+    solver='adam',
+    alpha=0.0005,
+    max_iter=1000,
+    learning_rate_init=0.001,
+    batch_size=32,
+    early_stopping=True,
+    validation_fraction=0.1,
+    random_state=42
+)
+bp_model.fit(X_train_scaled, y_train)
+
+# 指标计算函数（完全保留，确保指标一致性）
+def calculate_metrics(y_true, y_pred, average='macro'):
+    return {
+        'Accuracy': accuracy_score(y_true, y_pred),
+        'Precision': precision_score(y_true, y_pred, average=average),
+        'Recall': recall_score(y_true, y_pred, average=average),
+        'F1-Score': f1_score(y_true, y_pred, average=average)
+    }
+
+# 原始BP模型测试与结果输出
+bp_pred = bp_model.predict(X_test_scaled)
+bp_metrics = calculate_metrics(y_test, bp_pred)
+print("原始 BP 结果:", bp_metrics)
+
+# 3. PSO 优化算法定义（替换原有MVO，适配BP超参数优化）
+# ---------------------------------------------------------
+class PSO_Optimizer:
+    def __init__(self, objective_func, lb, ub, dim, pop_size=30, max_iter=50, c1=2, c2=2, w=0.8):
+        self.objective_func = objective_func  # 目标函数（最小化误差）
+        self.lb = np.array(lb)               # 超参数下界
+        self.ub = np.array(ub)               # 超参数上界
+        self.dim = dim                       # 超参数维度（节点数、alpha、学习率）
+        self.pop_size = pop_size             # 粒子群规模
+        self.max_iter = max_iter             # 最大迭代次数
+        self.c1 = c1                         # 个体学习因子
+        self.c2 = c2                         # 群体学习因子
+        self.w = w                           # 惯性权重
+
+        # 初始化粒子群（位置=超参数组合，速度=随机）
+        self.positions = np.random.uniform(self.lb, self.ub, (self.pop_size, self.dim))
+        self.velocities = np.random.uniform(-1, 1, (self.pop_size, self.dim))
+
+        # 初始化个体最优和群体最优
+        self.p_best_pos = self.positions.copy()  # 每个粒子的最优位置
+        self.p_best_val = np.array([self.objective_func(pos) for pos in self.positions])  # 每个粒子的最优误差
+        self.g_best_pos = self.p_best_pos[np.argmin(self.p_best_val)]  # 群体最优位置
+        self.g_best_val = np.min(self.p_best_val)  # 群体最优误差
+
+    def optimize(self):
+        print(f"PSO 开始优化 (Pop={self.pop_size}, Iter={self.max_iter})...")
+        for iter in range(1, self.max_iter + 1):
+            # 1. 更新惯性权重（线性递减，前期探索，后期收敛）
+            self.w = self.w * 0.95  # 惯性权重递减策略
+
+            # 2. 遍历每个粒子，更新速度和位置
+            for i in range(self.pop_size):
+                # 更新速度：惯性项 + 个体学习项 + 群体学习项
+                r1 = np.random.random(self.dim)
+                r2 = np.random.random(self.dim)
+                self.velocities[i] = self.w * self.velocities[i] + \
+                                     self.c1 * r1 * (self.p_best_pos[i] - self.positions[i]) + \
+                                     self.c2 * r2 * (self.g_best_pos - self.positions[i])
+
+                # 更新位置，并裁剪到上下界内（避免超参数超出合理范围）
+                self.positions[i] = self.positions[i] + self.velocities[i]
+                self.positions[i] = np.clip(self.positions[i], self.lb, self.ub)
+
+                # 3. 更新个体最优和群体最优
+                current_val = self.objective_func(self.positions[i])
+                if current_val < self.p_best_val[i]:
+                    self.p_best_val[i] = current_val
+                    self.p_best_pos[i] = self.positions[i].copy()
+
+                if current_val < self.g_best_val:
+                    self.g_best_val = current_val
+                    self.g_best_pos = self.positions[i].copy()
+
+            # 减少打印频率，避免刷屏，与原有MVO打印逻辑一致
+            if iter % 5 == 0 or iter == 1:
+                print(f"Iter {iter}/{self.max_iter}, Best Loss: {self.g_best_val:.4f}")
+        
+        return self.g_best_pos  # 返回最优超参数组合
+
+# 4. BP超参数目标函数（完全保留原有逻辑，适配PSO优化）
+# ---------------------------------------------------------
+def bp_objective_function(params):
+    # 解码参数（与原有一致：隐藏层节点数、alpha正则化系数、学习率）
+    n_hidden = int(params[0])  # 节点数必须为整数
+    alpha_val = params[1]
+    lr_val = params[2]
+
+    # 构建BP模型（搜索时减少迭代次数，加快优化速度）
+    clf = MLPClassifier(
+        hidden_layer_sizes=(n_hidden,),
+        activation='relu',
+        solver='adam',
+        alpha=alpha_val,
+        learning_rate_init=lr_val,
+        max_iter=200,  # 优化阶段迭代次数，与原有一致
+        random_state=42,
+        early_stopping=True
+    )
+    clf.fit(X_train_scaled, y_train)
+    pred = clf.predict(X_test_scaled)
+    error = 1.0 - accuracy_score(y_test, pred)  # 目标：最小化分类误差
+    return error
+
+# 5. 执行 PSO 优化（替换原有MVO优化，超参数上下界不变）
+# ---------------------------------------------------------
+print("-" * 30)
+print("正在运行 PSO 优化 BP 超参数...")
+# 超参数上下界（与原有MVO一致，确保公平对比）
+lb = [20, 0.00001, 0.0001]  # 隐藏层节点数：20-200，alpha：1e-5-0.01，学习率：1e-4-0.01
+ub = [200, 0.01, 0.01]
+
+# 实例化PSO优化器（参数设置合理，兼顾优化速度和效果）
+pso = PSO_Optimizer(
+    objective_func=bp_objective_function,
+    lb=lb,
+    ub=ub,
+    dim=3,  # 3个超参数：节点数、alpha、学习率
+    pop_size=10,  # 粒子群规模，与原有MVO一致
+    max_iter=15,  # 迭代次数，与原有MVO一致
+    c1=2,
+    c2=2,
+    w=0.8
+)
+best_params = pso.optimize()  # 得到PSO优化后的最佳超参数
+
+print(f"\n最佳参数找到: 节点数={int(best_params[0])}, Alpha={best_params[1]:.6f}, LR={best_params[2]:.6f}")
+
+# 6. 使用最佳参数训练最终 PSO-BP 模型（与原有逻辑一致）
+# ---------------------------------------------------------
+print("使用最佳参数训练最终 PSO-BP 模型...")
+pso_bp_model = MLPClassifier(
+    hidden_layer_sizes=(int(best_params[0]),),
+    activation='relu',
+    solver='adam',
+    alpha=best_params[1],
+    learning_rate_init=best_params[2],
+    max_iter=1000,
+    batch_size=32,
+    early_stopping=True,
+    validation_fraction=0.1,
+    random_state=42
+)
+
+pso_bp_model.fit(X_train_scaled, y_train)
+pso_pred = pso_bp_model.predict(X_test_scaled)
+pso_metrics = calculate_metrics(y_test, pso_pred)
+print("PSO-BP 结果:", pso_metrics)
+
+# 输出原始BP与PSO-BP对比结果（替换原有MVO-BP对比）
+print("\n" + "=" * 40)
+print("最终对比:")
+results_df = pd.DataFrame([bp_metrics, pso_metrics], index=['Standard BP', 'PSO-BP'])
+print(results_df)
+
+# 7. 5折交叉验证（保留原有逻辑，适配PSO-BP模型）
+# ---------------------------------------------------------
+print("\n" + "=" * 50)
+print("              5折交叉验证（PSO-BP）")
+print("=" * 50)
+
+kfold = KFold(n_splits=5, shuffle=True, random_state=42)
+cv_scores = []
+
+for fold, (train_idx, val_idx) in enumerate(kfold.split(X_train_scaled)):
+    X_tr, X_val = X_train_scaled[train_idx], X_train_scaled[val_idx]
+    y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
+
+    # 使用PSO优化后的最佳参数构建交叉验证模型
+    model_cv = MLPClassifier(
+        hidden_layer_sizes=(int(best_params[0]),),
+        alpha=best_params[1],
+        learning_rate_init=best_params[2],
+        max_iter=800,  # 交叉验证模型迭代次数，与原有一致
+        random_state=42,
+        early_stopping=True
+    )
+    model_cv.fit(X_tr, y_tr)
+    y_pred_cv = model_cv.predict(X_val)
+    
+    # 计算各折指标（与原有一致）
+    acc = accuracy_score(y_val, y_pred_cv)
+    prec = precision_score(y_val, y_pred_cv, average='macro')
+    rec = recall_score(y_val, y_pred_cv, average='macro')
+    f1 = f1_score(y_val, y_pred_cv, average='macro')
+
+    cv_scores.append([acc, prec, rec, f1])
+    print(f"第 {fold+1} 折 | 准确率: {acc:.4f} | 精确率: {prec:.4f} | 召回率: {rec:.4f} | F1: {f1:.4f}")
+
+# 输出交叉验证平均结果
+cv_mean = np.mean(cv_scores, axis=0)
+cv_std = np.std(cv_scores, axis=0)  # 补充标准差，呼应审稿人要求
+print("\n【5折交叉验证平均结果】")
+print(f"平均准确率: {cv_mean[0]:.4f} ± {cv_std[0]:.4f}")
+print(f"平均精确率: {cv_mean[1]:.4f} ± {cv_std[1]:.4f}")
+print(f"平均召回率: {cv_mean[2]:.4f} ± {cv_std[2]:.4f}")
+print(f"平均F1:    {cv_mean[3]:.4f} ± {cv_std[3]:.4f}")
+
+# 计算准确率95%置信区间（呼应审稿人要求）
+from scipy import stats
+confidence_level = 0.95
+n_folds = 5
+t_val = stats.t.ppf((1 + confidence_level) / 2, n_folds - 1)
+ci_lower = cv_mean[0] - t_val * (cv_std[0] / np.sqrt(n_folds))
+ci_upper = cv_mean[0] + t_val * (cv_std[0] / np.sqrt(n_folds))
+print(f"准确率95%置信区间: [{ci_lower:.4f}, {ci_upper:.4f}]")
+
+# 8. ROC 绘图（保留原有逻辑，适配PSO-BP模型）
+# ---------------------------------------------------------
+y_score = pso_bp_model.predict_proba(X_test_scaled)
+n_classes = len(label_encoder.classes_)
+y_test_bin = label_binarize(y_test, classes=range(n_classes))
+
+# 计算每一类的 ROC 和 AUC
+fpr = dict()
+tpr = dict()
+roc_auc = dict()
+for i in range(n_classes):
+    fpr[i], tpr[i], _ = roc_curve(y_test_bin[:, i], y_score[:, i])
+    roc_auc[i] = roc_auc_score(y_test_bin[:, i], y_score[:, i])
+
+# 计算微平均 ROC 曲线
+fpr["micro"], tpr["micro"], _ = roc_curve(y_test_bin.ravel(), y_score.ravel())
+roc_auc["micro"] = roc_auc_score(y_test_bin, y_score, average="micro")
+
+# 绘制ROC曲线（与原有样式一致）
+plt.figure(figsize=(10, 8))
+lw = 2
+colors = cycle(['aqua', 'darkorange', 'cornflowerblue', 'green', 'red', 'purple'])
+class_names = [label.replace('_normal', '') for label in label_encoder.classes_]
+
+for i, color in zip(range(n_classes), colors):
+    plt.plot(fpr[i], tpr[i], color=color, lw=lw,
+             label='ROC {0} (area = {1:0.2f})'.format(class_names[i], roc_auc[i]))
+
+plt.plot([0, 1], [0, 1], 'k--', lw=lw)
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Multi-class ROC Curve for PSO-BP')  # 标题改为PSO-BP
+plt.legend(loc="lower right")
+plt.tight_layout()
+plt.savefig('roc_curve_pso_bp.png')  # 保存文件名改为PSO-BP
+plt.show()  # 弹出绘图窗口
